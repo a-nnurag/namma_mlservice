@@ -1,0 +1,965 @@
+================================================================================
+NAMMAKELSA — ML SERVICE: COMPLETE SYSTEM DESIGN PLAN
+================================================================================
+Project      : NammaKelsa — Blue Collar / Polytechnic Job Readiness Platform
+Service      : ml-service (standalone FastAPI microservice)
+Author       : Anurag Chaurasia
+Last Updated : 2026-05-03
+Status       : Pre-implementation design (approved, ready to build)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Purpose & Scope
+2.  What This Service Does NOT Own
+3.  Inputs Into This Service
+4.  Full Data Flow
+5.  Kafka Topics & Message Schema
+6.  Redis Chunk Buffer Strategy
+7.  File Storage — Strategy Pattern (Local → S3)
+8.  Celery Task Design
+9.  Pipeline Components (Existing + New)
+10. Interview Scorer — Strategy Pattern
+11. WorkExp Analyzer
+12. Verdict Engine Logic
+13. PostgreSQL Schema
+14. API Endpoints
+15. Folder Structure
+16. Docker Compose Services
+17. Build Order
+18. Environment Variables
+19. Key Design Decisions & Rationale
+
+
+================================================================================
+1. PURPOSE & SCOPE
+================================================================================
+
+This microservice receives interview and work experience media from a backend
+via Kafka, runs all ML inference, and produces a final candidate verdict:
+
+  READY              — candidate is ready for the job
+  SKILL_TRAINING     — has potential but needs training
+  MANUAL_VERIFICATION — system cannot auto-verify, human review needed
+  UNSKILLED          — scores too low across all signals
+  FRAUD              — identity fraud, spoof attack, or duplicate detected
+
+Target job roles (v1):
+  electrician, plumber, welder, carpenter, mason, labour
+
+The service is designed for hackathon deployment but with production-ready
+architecture: strategy patterns for swappable backends, Celery for async
+processing, structured logging, and Docker Compose for one-command spin-up.
+
+
+================================================================================
+2. WHAT THIS SERVICE DOES NOT OWN
+================================================================================
+
+  - Candidate authentication / JWT tokens          (backend owns this)
+  - Form data collection                           (backend owns this)
+  - Chatbot / interview question logic             (backend owns this)
+  - Candidate notifications (email/SMS)            (backend owns this)
+  - Frontend                                       (separate service)
+  - Kafka topic creation / partition management    (infra / backend owns this)
+
+
+================================================================================
+3. INPUTS INTO THIS SERVICE
+================================================================================
+
+  Via Kafka (chunked binary):
+    - Interview video   (MP4 / WebM, ~1-2 min, recorded by chatbot)
+    - Interview audio   (WAV / OGG / MP3, extracted by backend before chunking
+                         OR the same video but audio-only track)
+    - Work exp video    (MP4, candidate's work demonstration, optional)
+
+  Via HTTP POST (direct upload):
+    - Degree image      (JPG / PNG, small, sync processing)
+
+  Via PostgreSQL (pre-existing data, written by backend):
+    - candidate_id
+    - claimed_job_role  (one of: electrician, plumber, welder, carpenter,
+                         mason, labour)
+    - has_workexp       (bool — if false, workexp pipeline is skipped)
+    - has_degree        (bool — if false, degree check is skipped)
+
+  Via Kafka meta topic (candidate.meta):
+    - Signal from backend when all media has been sent for a candidate
+      {"candidate_id": "uuid", "has_workexp": true, "has_degree": false}
+    - This tells the ML service what to expect before triggering pipeline
+
+
+================================================================================
+4. FULL DATA FLOW
+================================================================================
+
+Backend
+  |
+  |-- Kafka: candidate.interview.video  (chunks, key=candidate_id)
+  |-- Kafka: candidate.interview.audio  (chunks, key=candidate_id)
+  |-- Kafka: candidate.workexp.video    (chunks, key=candidate_id, optional)
+  |-- Kafka: candidate.meta             (trigger signal, key=candidate_id)
+  |
+  v
+FastAPI ML Service (startup: launches Kafka consumer as background thread)
+  |
+  v
+Redis Buffer
+  key: media:{candidate_id}:{media_type}:chunks  → List of base64 chunks
+  key: media:{candidate_id}:meta                 → candidate meta JSON
+  TTL: 24 hours on all keys (auto-cleanup for abandoned sessions)
+  |
+  | when meta received AND all expected media types have is_last=True
+  v
+Assemble files to disk (via StorageBackend)
+  /tmp/ml-service/{candidate_id}/interview_video.mp4
+  /tmp/ml-service/{candidate_id}/interview_audio.wav
+  /tmp/ml-service/{candidate_id}/workexp_video.mp4   (if has_workexp)
+  |
+  v
+Update DB: pipeline_runs.status = CHUNKS_RECEIVED
+  |
+  v
+Celery Task queued (Redis broker)
+  run_pipeline(candidate_id)
+  |
+  v
+Update DB: pipeline_runs.status = PROCESSING
+  |
+  |-- chord parallel group:
+  |     |
+  |     |-- fraud_task(candidate_id)
+  |     |     face_validation(interview_video)
+  |     |     liveness_detector(interview_video)
+  |     |     duplicate_check(selfie_frame, interview_audio)
+  |     |     fraud_flag(above 3 results)
+  |     |     → writes fraud scores to pipeline_results
+  |     |
+  |     |-- workexp_task(candidate_id)           [skipped if has_workexp=false]
+  |     |     extract frames from workexp_video
+  |     |     workexp_analyzer(frames, claimed_role)
+  |     |     → writes workexp scores to pipeline_results
+  |     |
+  |     |-- interview_task(candidate_id)
+  |           whisper_service(interview_audio) → transcript
+  |           interview_scorer(transcript, claimed_role) → domain/comm scores
+  |           → writes interview scores to pipeline_results
+  |
+  | chord callback (runs after all 3 complete):
+  v
+verdict_task(candidate_id)
+  reads all sub-scores from pipeline_results
+  verdict_engine(fraud, interview, workexp, degree) → final_verdict
+  writes final_verdict to pipeline_results
+  update DB: pipeline_runs.status = DONE
+  delete temp files from disk
+  |
+  v
+Backend polls: GET /verdict/{candidate_id}
+
+Degree image (separate sync flow):
+  POST /degree/{candidate_id}  (multipart image upload)
+  → degree_checker(image) → OCR + validation
+  → writes degree scores to pipeline_results immediately
+  → returns result in HTTP response
+
+
+================================================================================
+5. KAFKA TOPICS & MESSAGE SCHEMA
+================================================================================
+
+Topics:
+  candidate.interview.video
+  candidate.interview.audio
+  candidate.workexp.video
+  candidate.meta
+
+Chunk message schema (JSON):
+  {
+    "candidate_id": "550e8400-e29b-41d4-a716-446655440000",
+    "chunk_seq":    3,
+    "is_last":      false,
+    "data":         "<base64 encoded bytes>"
+  }
+
+Meta message schema (JSON):
+  {
+    "candidate_id":  "550e8400-e29b-41d4-a716-446655440000",
+    "has_workexp":   true,
+    "has_degree":    false,
+    "claimed_role":  "electrician"
+  }
+
+Ordering guarantee:
+  All messages for a candidate use candidate_id as the Kafka message KEY.
+  Kafka hashes the key → always routes to same partition → consumed in order.
+  Partition count should equal max expected concurrent ML worker instances.
+
+Consumer group: ml-service-group
+  Each ML service instance reads assigned partitions.
+  Kafka auto-rebalances when instances are added/removed.
+
+
+================================================================================
+6. REDIS CHUNK BUFFER STRATEGY
+================================================================================
+
+Keys (all with 24-hour TTL, reset on each write):
+  media:{candidate_id}:{media_type}:chunks  → Redis List
+    RPUSH on each chunk (preserves order)
+    LRANGE 0 -1 to read all chunks for assembly
+
+  media:{candidate_id}:meta  → Redis String (JSON)
+    Written when candidate.meta message arrives
+
+  media:{candidate_id}:received  → Redis Set
+    Members: "interview_video", "interview_audio", "workexp_video"
+    SADD on each is_last=True
+    When Set contains all expected types (from meta) → trigger assembly
+
+Assembly trigger logic:
+  on each is_last=True message:
+    SADD media:{candidate_id}:received  {media_type}
+    expected = {"interview_video", "interview_audio"}
+    if has_workexp: expected.add("workexp_video")
+    if received == expected:
+        → assemble all media → queue Celery task
+
+Chunk assembly:
+  chunks = LRANGE media:{candidate_id}:{media_type}:chunks 0 -1
+  sorted by chunk_seq (validate no gaps, flag FAILED if gap detected)
+  bytes = b"".join(base64.decode(c) for c in sorted_chunks)
+  storage.write("{candidate_id}/{media_type}.mp4", bytes)
+
+
+================================================================================
+7. FILE STORAGE — STRATEGY PATTERN (LOCAL → S3)
+================================================================================
+
+Abstract interface (app/storage/base.py):
+  class StorageBackend(ABC):
+    def write(self, key: str, data: bytes) -> str      # returns file path
+    def read(self, key: str) -> bytes
+    def delete(self, key: str) -> None
+    def get_path(self, key: str) -> str                # local path or presigned URL
+
+Implementations:
+  LocalStorageBackend (app/storage/local.py)
+    base_dir = /tmp/ml-service/  (configurable via env)
+    Used for: hackathon, single-instance deployment
+
+  S3StorageBackend (app/storage/s3.py)
+    boto3 + bucket name from env
+    Used for: production, multi-instance deployment
+    Stub implementation in v1, wire up later
+
+Selection (app/config.py):
+  STORAGE_BACKEND=local    → LocalStorageBackend
+  STORAGE_BACKEND=s3       → S3StorageBackend
+
+The pipeline tasks only call storage.write() / storage.read() / storage.delete()
+and never reference local paths directly. Swapping Local → S3 requires only
+changing one env var.
+
+
+================================================================================
+8. CELERY TASK DESIGN
+================================================================================
+
+Broker:  Redis (same Redis instance, different DB index from chunk buffer)
+Backend: Redis (stores task results)
+
+Tasks:
+  run_pipeline(candidate_id)
+    Orchestrator. Builds chord of 3 parallel tasks + verdict callback.
+    Sets DB status = PROCESSING.
+
+  fraud_task(candidate_id)
+    Reads interview_video.mp4 and interview_audio.wav from storage.
+    Extracts selfie frame at t=2s (for duplicate check).
+    Runs: face_validation → liveness_detector → duplicate_check → fraud_flag.
+    Writes fraud scores to pipeline_results (upsert).
+
+  workexp_task(candidate_id)
+    Reads workexp_video.mp4 from storage.
+    Skipped (returns default) if has_workexp=false in meta.
+    Runs: workexp_analyzer(frames, claimed_role).
+    Writes workexp scores to pipeline_results (upsert).
+
+  interview_task(candidate_id)
+    Reads interview_audio.wav from storage.
+    Runs: whisper_service(audio) → transcript.
+    Runs: interview_scorer(transcript, claimed_role) → scores.
+    Writes interview scores + transcript to pipeline_results (upsert).
+
+  verdict_task(candidate_id)
+    Chord callback — runs after fraud, workexp, interview all complete.
+    Reads all sub-scores from pipeline_results.
+    Reads degree scores (already in DB from sync /degree endpoint).
+    Runs: verdict_engine(fraud, interview, workexp, degree).
+    Writes final_verdict + composite_score to pipeline_results.
+    Sets DB status = DONE.
+    Deletes temp files via storage.delete().
+
+Retry policy:
+  max_retries = 3
+  retry_backoff = exponential (60s, 120s, 240s)
+  on_failure: set DB status = FAILED, log error
+
+Dead letter:
+  After 3 failures → set status = FAILED
+  Admin can re-trigger via POST /admin/trigger/{candidate_id}
+
+Celery chord:
+  from celery import chord
+  job = chord(
+      [fraud_task.si(cid), workexp_task.si(cid), interview_task.si(cid)],
+      verdict_task.si(cid)
+  )
+  job.apply_async()
+
+
+================================================================================
+9. PIPELINE COMPONENTS (EXISTING + NEW)
+================================================================================
+
+--- EXISTING (copy from face/ directory, no changes) ---
+
+face_validation.py
+  Function : validate_face_in_video(video_path: str) -> dict
+  Input    : path to interview video file
+  Process  : extracts frame every 2s, DeepFace Facenet embeddings,
+             cosine similarity vs first detected face
+  Output   : {face_consistency_score, same_person_score,
+              face_missing_seconds, flags, verdict}
+
+liveness_detector.py
+  Function : detect_liveness(video_path: str) -> dict
+  Input    : path to interview video file
+  Process  : MediaPipe FaceLandmarker 478-point, checks blink (EAR<0.22),
+             head movement, mouth movement, texture (Laplacian variance)
+  Output   : {liveness_score, blink_detected, head_moved, mouth_moved,
+              is_live, verdict, details}
+
+duplicate_check.py
+  Function : check_duplicate(candidate_id, image_input, audio_path) -> dict
+  Input    : candidate_id (str), selfie image (path or BGR numpy),
+             audio path (optional)
+  Process  : ArcFace 512-dim face embedding vs stored embeddings (cosine),
+             Resemblyzer 256-dim voice embedding vs stored embeddings
+  Output   : {is_duplicate, confidence, face_match, voice_match, verdict}
+
+fraud_flag.py
+  Function : compute_fraud_score(face_result, liveness_result, dup_result) -> dict
+  Input    : output dicts from above 3 functions
+  Process  : weighted aggregation (dup 40%, liveness 30%, identity 20%, presence 10%)
+  Output   : {fraud_score, fraud_level, recommended_action, flags,
+              face_summary, liveness_summary, duplicate_summary}
+
+whisper_service.py
+  Function : transcribe_audio(audio_path: str, language: str) -> dict
+  Input    : audio file path, language code (kn/hi/en)
+  Process  : convert to 16kHz WAV, Google Speech API, translate to English
+  Output   : {text, original_text, language, source}
+
+--- NEW (to be built) ---
+
+interview_scorer.py  [STRATEGY PATTERN — see Section 10]
+  Function : score_interview(transcript: str, job_role: str) -> dict
+  Input    : English transcript (from whisper), claimed job role
+  Process  : LLM prompt with role-specific rubric
+  Output   : {domain_score, communication_score, confidence_score,
+              strengths, gaps, raw_response}
+
+workexp_analyzer.py  [see Section 11]
+  Function : analyze_workexp(video_path: str, claimed_role: str) -> dict
+  Input    : work exp video path, claimed job role
+  Process  : extract frames every 3s, send to VLM with role-specific prompt
+  Output   : {detected_skill, skill_confidence, matches_claimed_role,
+              observations, verdict}
+
+degree_checker.py
+  Function : check_degree(image_path: str) -> dict
+  Input    : degree image path (JPG/PNG)
+  Process  : pytesseract OCR → extract text → check for degree keywords,
+             institution name, year; validate document structure
+  Output   : {is_valid_doc, extracted_degree, extracted_institution,
+              extracted_year, confidence, raw_text}
+
+verdict_engine.py
+  Function : compute_verdict(fraud, interview, workexp, degree,
+                              has_workexp: bool, has_degree: bool) -> dict
+  Input    : all sub-score dicts + has_workexp/has_degree flags
+  Process  : see Section 12
+  Output   : {final_verdict, composite_score, verdict_reason, recommended_action}
+
+
+================================================================================
+10. INTERVIEW SCORER — STRATEGY PATTERN
+================================================================================
+
+Why strategy pattern:
+  The best LLM for scoring interviews is not yet decided.
+  Different deployments may use Claude, Gemini, or OpenAI.
+  The strategy pattern lets us swap LLM backend via one env var
+  without changing any pipeline task code.
+
+Abstract interface (app/pipeline/interview_scorer.py):
+  class InterviewScorerBackend(ABC):
+      def score(self, transcript: str, job_role: str) -> dict
+
+Implementations:
+  ClaudeInterviewScorer     (uses Anthropic Claude API)
+  GeminiInterviewScorer     (uses Google Gemini API)
+  OpenAIInterviewScorer     (uses OpenAI GPT API)
+  RuleBasedInterviewScorer  (keyword matching, no API — fallback/offline)
+
+Selection (app/config.py):
+  INTERVIEW_SCORER_BACKEND=claude    → ClaudeInterviewScorer
+  INTERVIEW_SCORER_BACKEND=gemini    → GeminiInterviewScorer
+  INTERVIEW_SCORER_BACKEND=openai    → OpenAIInterviewScorer
+  INTERVIEW_SCORER_BACKEND=rules     → RuleBasedInterviewScorer (offline)
+
+Scoring rubric (same for all backends, passed as system prompt):
+  Given a transcript of a blue-collar job interview and the candidate's
+  claimed job role, score on:
+
+  domain_score (0.0–1.0):
+    Does the candidate demonstrate knowledge of their claimed trade?
+    For electrician: wiring, safety, tools, circuit basics
+    For plumber: pipes, joints, water pressure, fixtures
+    For welder: welding types (MIG/TIG/Arc), metals, safety gear
+    For carpenter: wood types, joints, tools, measurements
+    For mason: brickwork, mortar, leveling, materials
+    For labour: general site safety, tool handling, following instructions
+
+  communication_score (0.0–1.0):
+    Clarity, coherence, ability to explain concepts simply
+
+  confidence_score (0.0–1.0):
+    Certainty in answers, not hesitant or contradictory
+
+Output:
+  {
+    "domain_score":        0.0–1.0,
+    "communication_score": 0.0–1.0,
+    "confidence_score":    0.0–1.0,
+    "strengths":           ["list of positive signals"],
+    "gaps":                ["list of knowledge gaps"],
+    "raw_response":        "full LLM response string"
+  }
+
+
+================================================================================
+11. WORKEXP ANALYZER
+================================================================================
+
+Function : analyze_workexp(video_path: str, claimed_role: str) -> dict
+
+Process:
+  1. Extract frames every 3 seconds from workexp video
+  2. Select up to 10 representative frames (uniform sampling)
+  3. For each frame, send to a VLM (Claude Vision / Gemini Vision)
+     with the following prompt:
+       "This is a frame from a work experience video.
+        The candidate claims to be a {claimed_role}.
+        Describe what you see. Is the activity consistent with {claimed_role}
+        work? What tools, materials, or environment are visible?"
+  4. Aggregate responses → determine:
+       detected_skill: what skill/trade is actually visible
+       matches_claimed_role: does detected match claimed
+       skill_confidence: how confident is the match (0.0–1.0)
+  5. If VLM is unavailable (offline) → fall back to frame-based
+     color/texture heuristics (hardhat detected, orange vest, tools, etc.)
+
+Supported claimed roles and their VLM detection signals:
+  electrician : wires, switchboards, conduit, multimeter, electrical panel
+  plumber     : pipes, wrenches, PVC fittings, tap, sink, water
+  welder      : welding mask, sparks, metal, torch, protective gear
+  carpenter   : wood, saw, hammer, nails, workbench, lumber
+  mason       : bricks, mortar, trowel, scaffolding, wall construction
+  labour      : construction site, digging, carrying materials, general tools
+
+Output:
+  {
+    "detected_skill":       "electrician",
+    "skill_confidence":     0.82,
+    "matches_claimed_role": true,
+    "observations":         ["saw electrical panel", "candidate using multimeter"],
+    "verdict":              "VERIFIED" | "PARTIAL" | "MISMATCH" | "UNCLEAR"
+  }
+
+
+================================================================================
+12. VERDICT ENGINE LOGIC
+================================================================================
+
+Function : compute_verdict(fraud, interview, workexp, degree,
+                            has_workexp, has_degree) -> dict
+
+Step 1 — Hard FRAUD gate (overrides everything):
+  if fraud["fraud_level"] in ("HIGH", "CRITICAL"):
+    return FRAUD
+
+Step 2 — Hard MANUAL_VERIFICATION gates:
+  if fraud["fraud_level"] == "MEDIUM":
+    return MANUAL_VERIFICATION
+  if has_workexp and workexp["skill_confidence"] < 0.40:
+    return MANUAL_VERIFICATION    # system can't auto-verify claimed work
+  if workexp["verdict"] == "MISMATCH":
+    return MANUAL_VERIFICATION    # claimed role doesn't match video
+
+Step 3 — Composite score calculation:
+  workexp_score = workexp["skill_confidence"] if has_workexp else 0.5
+    (0.5 = neutral, no evidence either way)
+
+  composite = (
+    interview["domain_score"]        * 0.40 +
+    interview["communication_score"] * 0.20 +
+    workexp_score                    * 0.30 +
+    interview["confidence_score"]    * 0.10
+  )
+
+Step 4 — Verdict from composite:
+  composite >= 0.70  → READY
+  composite >= 0.40  → SKILL_TRAINING
+  composite <  0.40  → UNSKILLED
+
+Step 5 — Degree note (informational, does not change verdict in v1):
+  if has_degree and not degree["is_valid_doc"]:
+    add flag: "Degree document could not be verified — manual check recommended"
+
+Output:
+  {
+    "final_verdict":       "READY",
+    "composite_score":     0.76,
+    "verdict_reason":      "High domain knowledge, good communication, work exp verified",
+    "recommended_action":  "PASS" | "MANUAL_REVIEW" | "REJECT"
+  }
+
+recommended_action mapping:
+  READY                 → PASS
+  SKILL_TRAINING        → PASS (with training flag)
+  MANUAL_VERIFICATION   → MANUAL_REVIEW
+  UNSKILLED             → MANUAL_REVIEW
+  FRAUD                 → REJECT
+
+
+================================================================================
+13. POSTGRESQL SCHEMA
+================================================================================
+
+Table: pipeline_runs
+  id                UUID         PRIMARY KEY DEFAULT gen_random_uuid()
+  candidate_id      UUID         NOT NULL
+  status            VARCHAR(30)  NOT NULL DEFAULT 'PENDING'
+                                 -- PENDING, CHUNKS_RECEIVED, PROCESSING,
+                                 -- DONE, FAILED
+  retry_count       INT          DEFAULT 0
+  error             TEXT
+  created_at        TIMESTAMP    DEFAULT now()
+  updated_at        TIMESTAMP    DEFAULT now()
+
+  INDEX: candidate_id
+
+Table: pipeline_results
+  id                      UUID    PRIMARY KEY DEFAULT gen_random_uuid()
+  run_id                  UUID    REFERENCES pipeline_runs(id)
+  candidate_id            UUID    NOT NULL
+
+  -- Face validation
+  face_consistency_score  FLOAT
+  same_person_score       FLOAT
+  face_missing_seconds    INT
+  face_verdict            VARCHAR(20)
+
+  -- Liveness
+  liveness_score          FLOAT
+  blink_detected          BOOLEAN
+  head_moved              BOOLEAN
+  mouth_moved             BOOLEAN
+  liveness_verdict        VARCHAR(20)
+
+  -- Duplicate check
+  is_duplicate            BOOLEAN
+  face_match_score        FLOAT
+  voice_match_score       FLOAT
+  duplicate_verdict       VARCHAR(20)
+  matched_candidate_id    UUID
+
+  -- Fraud aggregate
+  fraud_score             FLOAT
+  fraud_level             VARCHAR(20)
+  fraud_flags             JSONB
+
+  -- Interview scoring
+  domain_score            FLOAT
+  communication_score     FLOAT
+  confidence_score        FLOAT
+  transcript              TEXT
+
+  -- Work experience
+  detected_skill          VARCHAR(100)
+  skill_confidence        FLOAT
+  matches_claimed_role    BOOLEAN
+  workexp_verdict         VARCHAR(20)
+
+  -- Degree check
+  is_valid_doc            BOOLEAN
+  extracted_degree        VARCHAR(200)
+  extracted_institution   VARCHAR(200)
+  extracted_year          VARCHAR(10)
+
+  -- Final verdict
+  composite_score         FLOAT
+  final_verdict           VARCHAR(30)
+  verdict_reason          TEXT
+  recommended_action      VARCHAR(20)
+
+  created_at              TIMESTAMP DEFAULT now()
+
+  INDEX: candidate_id
+
+
+================================================================================
+14. API ENDPOINTS
+================================================================================
+
+GET  /health
+  Returns: model load status for each pipeline component,
+           Redis connection status, Postgres connection status,
+           Celery active worker count, queue depth
+  Used by: load balancer health checks, judges demo
+
+GET  /status/{candidate_id}
+  Returns: {candidate_id, status, updated_at}
+  Used by: backend polling (lightweight, no ML data)
+
+GET  /verdict/{candidate_id}
+  Returns: full pipeline_results row + final_verdict
+  Used by: backend once status == DONE
+
+POST /degree/{candidate_id}
+  Body:    multipart/form-data, field: "image" (JPG/PNG)
+  Process: sync OCR + validation
+  Returns: degree_checker output dict
+  Used by: backend immediately after candidate uploads degree image
+
+POST /admin/trigger/{candidate_id}
+  Purpose: manually re-trigger pipeline for a candidate
+           (used after FAILED status or for re-processing)
+  Returns: {task_id, status: "queued"}
+
+GET  /admin/candidates
+  Returns: list of all pipeline_runs with status + summary
+  Used by: admin dashboard
+
+All endpoints return JSON. All errors return:
+  {"error": "message", "candidate_id": "...", "timestamp": "..."}
+
+
+================================================================================
+15. FOLDER STRUCTURE
+================================================================================
+
+ml-service/
+├── app/
+│   ├── main.py                       # FastAPI app init, startup events,
+│   │                                 # Kafka consumer launch, model warmup
+│   ├── config.py                     # pydantic-settings, all env vars,
+│   │                                 # storage/scorer backend selection
+│   │
+│   ├── consumers/
+│   │   └── kafka_consumer.py         # AIOKafka consumer, 3 topics,
+│   │                                 # routes messages to redis_buffer
+│   │
+│   ├── buffer/
+│   │   └── redis_buffer.py           # chunk RPUSH, assembly trigger logic,
+│   │                                 # TTL management, gap detection
+│   │
+│   ├── storage/
+│   │   ├── base.py                   # StorageBackend ABC
+│   │   ├── local.py                  # LocalStorageBackend (/tmp/ml-service/)
+│   │   └── s3.py                     # S3StorageBackend (boto3, stub in v1)
+│   │
+│   ├── tasks/
+│   │   ├── celery_app.py             # Celery instance, Redis broker config,
+│   │   │                             # retry policy, task routing
+│   │   ├── pipeline_task.py          # run_pipeline: chord orchestrator
+│   │   ├── fraud_task.py             # fraud_task: face+liveness+dup+fraud
+│   │   ├── workexp_task.py           # workexp_task: skill detection
+│   │   ├── interview_task.py         # interview_task: whisper + scorer
+│   │   └── verdict_task.py           # verdict_task: chord callback
+│   │
+│   ├── pipeline/
+│   │   ├── face_validation.py        # EXISTING — copied from face/ module
+│   │   ├── liveness_detector.py      # EXISTING — copied from face/ module
+│   │   ├── duplicate_check.py        # EXISTING — copied from face/ module
+│   │   ├── fraud_flag.py             # EXISTING — copied from face/ module
+│   │   ├── whisper_service.py        # EXISTING — copied from face/ module
+│   │   ├── interview_scorer.py       # NEW — strategy pattern (see Section 10)
+│   │   ├── workexp_analyzer.py       # NEW — VLM skill detection (Section 11)
+│   │   ├── degree_checker.py         # NEW — pytesseract OCR
+│   │   └── verdict_engine.py         # NEW — final verdict logic (Section 12)
+│   │
+│   ├── models/
+│   │   └── registry.py               # Singleton model loader
+│   │                                 # loads all heavy models once at startup:
+│   │                                 # DeepFace (Facenet + ArcFace),
+│   │                                 # MediaPipe FaceLandmarker,
+│   │                                 # Resemblyzer encoder
+│   │                                 # exposes get_model(name) globally
+│   │
+│   ├── db/
+│   │   ├── session.py                # async SQLAlchemy engine + session factory
+│   │   ├── models.py                 # ORM: PipelineRun, PipelineResult
+│   │   └── crud.py                   # upsert_scores(), update_status(),
+│   │                                 # get_result(), get_all_runs()
+│   │
+│   ├── api/
+│   │   ├── verdict.py                # GET /verdict/{id}, GET /status/{id}
+│   │   ├── degree.py                 # POST /degree/{id}
+│   │   ├── health.py                 # GET /health
+│   │   └── admin.py                  # POST /admin/trigger, GET /admin/candidates
+│   │
+│   └── core/
+│       └── logging.py                # structured JSON logging
+│                                     # every log line includes: candidate_id,
+│                                     # task_name, duration_ms, timestamp
+│
+├── tests/
+│   ├── test_buffer.py                # Redis buffer unit tests
+│   ├── test_pipeline.py              # pipeline component integration tests
+│   └── test_verdict.py               # verdict engine unit tests
+│
+├── Dockerfile                        # multi-stage, model pre-download layer
+├── docker-compose.yml                # all services (see Section 16)
+├── requirements.txt
+├── .env.example                      # all env vars with descriptions
+└── ML_SERVICE_PLAN.txt               # this file
+
+
+================================================================================
+16. DOCKER COMPOSE SERVICES
+================================================================================
+
+Service: redpanda
+  Image  : redpandadata/redpanda:v23.3.1
+  Ports  : 9092 (Kafka API internal), 19092 (external/host), 9644 (Admin API)
+  Note   : No Zookeeper needed. Redpanda is a single-binary Kafka replacement.
+  Topics : Created by redpanda-init container (NOT auto-created)
+    candidate.interview.video
+    candidate.interview.audio
+    candidate.workexp.video
+    candidate.meta
+    candidate.dlq
+
+Service: redpanda-init
+  Image  : redpandadata/redpanda:v23.3.1
+  Purpose: One-shot container that creates all topics via rpk CLI then exits
+  Depends: redpanda (healthy)
+
+Service: redpanda-console
+  Image  : redpandadata/console:latest
+  Port   : 8080
+  Purpose: Web UI — topic browser, consumer lag, message viewer
+  Depends: redpanda (healthy)
+
+Service: redis
+  Image  : redis:7-alpine
+  Port   : 6379
+  Two logical DBs:
+    DB 0 — Celery broker + result backend
+    DB 1 — chunk buffer
+
+Service: postgres
+  Image  : postgres:15-alpine
+  Port   : 5432
+  DB     : nammakelsa_ml
+  Schema auto-created on first startup via SQLAlchemy create_all()
+
+Service: ml-service
+  Build  : ./Dockerfile
+  Command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+  Port   : 8000
+  Depends: kafka, redis, postgres
+  Volumes: ./tmp:/tmp/ml-service   (temp file storage for hackathon)
+
+Service: celery-worker
+  Build  : ./Dockerfile (same image as ml-service)
+  Command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
+  Depends: redis, postgres
+  Volumes: ./tmp:/tmp/ml-service   (shared with ml-service for temp files)
+  Scale  : docker-compose up --scale celery-worker=3
+
+Service: flower  (Celery monitoring dashboard)
+  Build  : ./Dockerfile (same image)
+  Command: celery -A app.tasks.celery_app flower --port=5555
+  Port   : 5555
+  Purpose: real-time task monitoring, impressive for judges demo
+
+
+================================================================================
+17. BUILD ORDER
+================================================================================
+
+Phase 1 — Foundation (no ML, just infrastructure)
+  1. app/config.py            — all env vars, backend selection
+  2. app/db/session.py        — async SQLAlchemy engine
+  3. app/db/models.py         — PipelineRun, PipelineResult ORM
+  4. app/db/crud.py           — upsert_scores, update_status, get_result
+  5. app/core/logging.py      — structured JSON logger
+
+Phase 2 — Storage & Buffer
+  6. app/storage/base.py      — StorageBackend ABC
+  7. app/storage/local.py     — LocalStorageBackend
+  8. app/storage/s3.py        — S3StorageBackend stub
+  9. app/buffer/redis_buffer.py — chunk buffering + assembly trigger
+
+Phase 3 — Kafka Consumer
+  10. app/consumers/kafka_consumer.py — AIOKafka, 3 topics, routes to buffer
+
+Phase 4 — Celery
+  11. app/tasks/celery_app.py         — Celery + Redis broker
+  12. app/tasks/pipeline_task.py      — chord orchestrator
+
+Phase 5 — New Pipeline Components
+  13. app/pipeline/interview_scorer.py   — strategy pattern + all backends
+  14. app/pipeline/workexp_analyzer.py  — VLM skill detection
+  15. app/pipeline/degree_checker.py    — pytesseract OCR
+  16. app/pipeline/verdict_engine.py    — verdict logic
+
+Phase 6 — Celery Sub-Tasks
+  17. app/tasks/fraud_task.py
+  18. app/tasks/workexp_task.py
+  19. app/tasks/interview_task.py
+  20. app/tasks/verdict_task.py
+
+Phase 7 — Model Registry & API
+  21. app/models/registry.py      — singleton loader + startup warmup
+  22. app/api/verdict.py
+  23. app/api/degree.py
+  24. app/api/health.py
+  25. app/api/admin.py
+  26. app/main.py                  — wire everything together
+
+Phase 8 — Containerization
+  27. Dockerfile
+  28. docker-compose.yml
+  29. .env.example
+
+Phase 9 — Tests
+  30. tests/test_buffer.py
+  31. tests/test_pipeline.py
+  32. tests/test_verdict.py
+
+
+================================================================================
+18. ENVIRONMENT VARIABLES
+================================================================================
+
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_CONSUMER_GROUP=ml-service-group
+
+# Redis
+REDIS_URL=redis://localhost:6379
+REDIS_BROKER_DB=0
+REDIS_BUFFER_DB=1
+CHUNK_BUFFER_TTL_SECONDS=86400
+
+# PostgreSQL (ML service has its own separate DB, not shared with backend)
+DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/nammakelsa_ml
+
+# Storage backend
+STORAGE_BACKEND=local              # local | s3
+LOCAL_STORAGE_DIR=/tmp/ml-service
+
+# S3 (only needed if STORAGE_BACKEND=s3)
+S3_BUCKET_NAME=
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_REGION=
+
+# Interview scorer backend
+INTERVIEW_SCORER_BACKEND=claude    # claude | gemini | openai | rules
+
+# LLM API keys (only the one matching INTERVIEW_SCORER_BACKEND is needed)
+ANTHROPIC_API_KEY=
+GOOGLE_API_KEY=
+OPENAI_API_KEY=
+
+# Celery
+CELERY_CONCURRENCY=2
+CELERY_MAX_RETRIES=3
+
+# Service
+ML_SERVICE_PORT=8000
+LOG_LEVEL=INFO
+
+
+================================================================================
+19. KEY DESIGN DECISIONS & RATIONALE
+================================================================================
+
+Why Kafka for chunk delivery?
+  Decouples backend from ML service. If ML service is down or slow,
+  Kafka holds messages. Backend does not block waiting for ML.
+  Kafka replays from last offset if ML service restarts mid-stream.
+  Same chunks can be consumed by future analytics/logging services.
+
+Why Redis for chunk buffer?
+  Shared across multiple ML service instances (stateless instances).
+  Built-in TTL for automatic cleanup of abandoned sessions.
+  Fast append (RPUSH) and read (LRANGE) for ordered chunk lists.
+
+Why not MinIO?
+  MinIO would require uploading assembled files for storage.
+  But assembly already happens in-memory during buffer → disk write.
+  Adding MinIO adds a network hop with no benefit for single-server deployment.
+  S3StorageBackend stub covers the multi-server case when needed.
+
+Why Celery with Redis (not direct FastAPI background tasks)?
+  FastAPI BackgroundTasks die if the process restarts.
+  Celery tasks survive restarts (task state in Redis).
+  Celery supports retries, monitoring (Flower), and horizontal scaling.
+  Same pipeline can run on separate worker machines in production.
+
+Why strategy pattern for InterviewScorer?
+  Best LLM for blue-collar interview scoring is not proven yet.
+  Different customers may have API agreements with different providers.
+  Allows offline fallback (RuleBasedInterviewScorer) if no API keys available.
+  Swapping provider = change one env var, zero code change.
+
+Why strategy pattern for StorageBackend?
+  Hackathon runs on single server → local disk is simplest.
+  Production needs multi-server → S3.
+  Same task code, zero change when swapping.
+
+ML service DB is separate from backend DB:
+  The ML service owns its own Postgres instance (nammakelsa_ml).
+  The backend has its own separate DB (candidates, form data, auth, etc.).
+  The backend reads ML results by calling GET /verdict/{candidate_id}
+  over HTTP — it never connects directly to the ML service DB.
+  This keeps the services fully decoupled.
+
+Why one wide pipeline_results table (not normalized)?
+  A verdict query needs ALL sub-scores in one read.
+  Normalized tables would require 5+ JOINs on every /verdict call.
+  Each candidate has exactly one result row — no duplication concern.
+  JSONB column (fraud_flags) handles variable-length arrays cleanly.
+
+Why chord for Celery task parallelism?
+  fraud_task, workexp_task, interview_task are fully independent.
+  Running in parallel reduces total processing time from ~3x to ~1x.
+  verdict_task depends on all three — chord callback fires only when all done.
+
+Why Flower in Docker Compose?
+  Provides real-time visualization of task queue, workers, task history.
+  Judges can see the pipeline executing live during demo.
+  No extra code required — runs off existing Celery infrastructure.
+
+================================================================================
+END OF PLAN
+================================================================================

@@ -1,0 +1,405 @@
+================================================================================
+NAMMAKELSA — REDIS DESIGN
+================================================================================
+Redis version : 7.x
+Deployment    : Single instance (hackathon) → Redis Sentinel (production)
+Persistence   : RDB + AOF (see Section 4)
+================================================================================
+
+LOGICAL DB SEPARATION
+─────────────────────
+  DB 0 — ML Service: Celery broker + result backend  (managed by Celery)
+  DB 1 — ML Service: Kafka chunk buffer              (managed by ml-service)
+  DB 2 — Backend:    OTP, sessions, caches           (managed by backend)
+
+Each service uses its own DB index. Key collisions are impossible.
+All three DBs run on the same Redis instance for hackathon.
+For production: separate Redis instances per service for isolation.
+
+
+================================================================================
+1. BACKEND REDIS (DB 2)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+1.1 OTP MANAGEMENT
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : otp:{phone}
+Type    : Hash
+Fields  : otp (6-digit string), attempts (int 0-3), created_at (ISO timestamp)
+TTL     : 600 seconds (10 minutes)
+Commands: HSET, HGETALL, HINCRBY (for attempts), DEL (on success/expire)
+
+Example :
+  HSET otp:+919876543210  otp "482910"  attempts 0  created_at "2026-05-03T10:00:00Z"
+  EXPIRE otp:+919876543210 600
+
+Rules   :
+  - Max 3 wrong attempts → DEL key (force re-send)
+  - Max 3 sends per phone per hour (see ratelimit key below)
+  - On correct OTP → DEL key immediately
+
+────────────────────────────────────────────────────────────────────────────────
+1.2 ADMIN / OFFICER OTP  (added 2025-05-03)
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : admin:{phone}
+Type    : Hash
+Fields  : otp (6-digit string), attempts (int 0-3), created_at (ISO timestamp)
+TTL     : 600 seconds (10 minutes)
+Commands: same as citizen OTP (HSET, HGETALL, HINCRBY, DEL)
+
+Example :
+  HSET admin:+919876543210  otp "291847"  attempts 0  created_at "2026-05-03T10:00:00Z"
+  EXPIRE admin:+919876543210 600
+
+Rules   :
+  - Namespace "admin:" is intentionally distinct from citizen "otp:" — no collision
+  - OTP only stored when phone exists and is_active in admin_users table
+    (unknown phones silently return success — prevents phone enumeration)
+  - Rate limit key reuses: ratelimit:otp:send:admin:{phone}
+  - Max 3 wrong attempts → DEL key (same rules as citizen OTP)
+  - Implemented in: backend/admin/auth_routes.py  _otp_key() → "admin:{phone}"
+
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : ratelimit:otp:send:{phone}
+Type    : String (integer)
+TTL     : 3600 seconds (1 hour, sliding window)
+Commands: INCR, EXPIRE (reset TTL on first set), GET
+
+Example :
+  INCR ratelimit:otp:send:+919876543210
+  EXPIRE ratelimit:otp:send:+919876543210 3600
+
+Rules   :
+  - If value >= 3 → reject send, return "Too many OTP requests. Try after 1 hour."
+  - Use SET ... NX EX for atomic first-set:
+      SET ratelimit:otp:send:{phone} 1 NX EX 3600
+      INCR ratelimit:otp:send:{phone}   (for subsequent sends)
+
+
+────────────────────────────────────────────────────────────────────────────────
+1.2 JWT SESSION CACHE
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : session:{user_id}
+Type    : Hash
+Fields  : role, phone, is_registered (bool), is_active (bool), face_registered (bool)
+TTL     : 86400 seconds (24 hours), refreshed on each authenticated request
+Commands: HSET, HGETALL, EXPIRE, DEL (on logout or is_active=false)
+
+Example :
+  HSET session:550e8400-e29b-41d4-a716-446655440000
+      role "user"
+      phone "+919876543210"
+      is_registered "1"
+      is_active "1"
+      face_registered "1"
+  EXPIRE session:550e8400-e29b-41d4-a716-446655440000 86400
+
+Rules   :
+  - All protected routes: check Redis first, DB only on cache miss
+  - If is_active = "0" in cache → reject immediately (FRAUD block)
+  - When user is flagged FRAUD: DEL session:{user_id} to force re-auth rejection
+
+
+────────────────────────────────────────────────────────────────────────────────
+1.3 REGISTRATION STATE (temporary, during multi-step registration)
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : reg:face:{user_id}
+Type    : String (JSON)
+Value   : {"frame_extracted": true, "hash_checked": true}
+TTL     : 3600 seconds (1 hour — user must complete face step within 1h)
+
+Key     : ratelimit:face:{user_id}
+Type    : String (integer)
+TTL     : 3600 seconds
+Rules   : Max 3 face registration attempts per user per hour (prevents brute-force)
+
+
+────────────────────────────────────────────────────────────────────────────────
+1.4 COOLDOWN CACHE
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : cooldown:{user_id}:{skill_id}
+Type    : String (ISO 8601 timestamp)
+TTL     : Dynamic — set to (cooldown_until - now()) seconds
+Commands: SET, GET, TTL
+
+Example :
+  # cooldown_until = 2026-07-03T10:00:00Z, now = 2026-05-03T10:00:00Z
+  # TTL = 60 days = 5,184,000 seconds
+  SET cooldown:550e8400:a1b2c3d4  "2026-07-03T10:00:00Z"  EX 5184000
+
+Rules   :
+  - On skill selection: check GET cooldown:{user_id}:{skill_id}
+    If exists → reject with "In cooldown until {timestamp}"
+    If not exists → check DB (source of truth), re-cache if found
+  - Set on interview end (not verdict)
+  - TTL naturally expires when cooldown ends → fast path auto-clears
+
+
+────────────────────────────────────────────────────────────────────────────────
+1.5 ML STATUS POLL CACHE
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : ml_status:{application_id}
+Type    : String (JSON)
+TTL     : 60 seconds (background poller refreshes every 30s)
+Commands: SET, GET
+
+Values  :
+  {"status": "ML_PROCESSING"}
+  {"status": "DONE", "verdict": "READY", "composite_score": 0.82}
+  {"status": "FAILED", "error": "face_validation_error"}
+
+Rules   :
+  - Frontend hits GET /application/status/{id} every 10s
+  - Backend serves from Redis (never hits ML service directly for status checks)
+  - Background poller runs every 30s:
+      For each ML_PROCESSING application:
+        GET http://ml-service:8000/status/{candidate_id}
+        Update Redis ml_status:{application_id}
+        If DONE: also fetch verdict, update DB, update application status
+
+
+────────────────────────────────────────────────────────────────────────────────
+1.6 WORKEXP VIDEO CHUNKED UPLOAD STATE
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : upload:{upload_id}
+Type    : Hash
+Fields  :
+  application_id   (UUID string)
+  total_chunks     (int string)
+  file_size_bytes  (int string)
+  file_name        (string)
+  status           ("in_progress" | "assembling" | "complete" | "failed")
+  created_at       (ISO timestamp)
+TTL     : 86400 seconds (24 hours — resume window)
+
+Key     : upload:{upload_id}:received
+Type    : Set (of chunk_seq integers as strings)
+TTL     : 86400 seconds
+Commands: SADD, SMEMBERS, SCARD
+
+Example :
+  # After receiving chunks 0, 1, 2:
+  SADD upload:abc123:received  "0" "1" "2"
+  SCARD upload:abc123:received  → 3
+
+Rules   :
+  - On each chunk receive: SADD upload:{id}:received {chunk_seq}
+  - SADD is idempotent → re-sent chunks are ignored safely
+  - When SCARD == total_chunks → trigger assembly
+  - On assembly complete → HSET upload:{id} status "complete"
+  - On assembly fail → HSET upload:{id} status "failed"
+  - TTL ensures incomplete uploads auto-cleanup after 24h
+
+
+================================================================================
+2. ML SERVICE REDIS DB 1 (CHUNK BUFFER)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+2.1 MEDIA CHUNK BUFFER
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : media:{candidate_id}:{media_type}:chunks
+Type    : List (ordered)
+TTL     : 86400 seconds (reset on each RPUSH)
+Commands: RPUSH, LRANGE 0 -1, LLEN, DEL
+
+media_type values: interview_video | interview_audio | workexp_video
+
+Example :
+  RPUSH media:550e8400:interview_video:chunks  "<base64_chunk_0>"
+  RPUSH media:550e8400:interview_video:chunks  "<base64_chunk_1>"
+  LRANGE media:550e8400:interview_video:chunks 0 -1   → all chunks in order
+
+Rules   :
+  - Kafka consumer does RPUSH for each chunk
+  - Ordering guaranteed by Kafka (same partition) → RPUSH maintains order
+  - On is_last=True: read all, sort by chunk_seq, validate no gaps
+  - After assembly to disk: DEL this key
+
+────────────────────────────────────────────────────────────────────────────────
+2.2 CANDIDATE META
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : media:{candidate_id}:meta
+Type    : String (JSON)
+TTL     : 86400 seconds
+Commands: SET, GET
+
+Value   :
+  {
+    "candidate_id":   "550e8400-...",
+    "has_workexp":    true,
+    "has_degree":     false,
+    "claimed_role":   "electrician",
+    "session_id":     "uuid",
+    "application_id": "uuid"
+  }
+
+────────────────────────────────────────────────────────────────────────────────
+2.3 RECEIVED MEDIA TRACKER
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : media:{candidate_id}:received
+Type    : Set
+TTL     : 86400 seconds
+Members : "interview_video" | "interview_audio" | "workexp_video"
+Commands: SADD, SMEMBERS
+
+Rules   :
+  - SADD on each is_last=True message
+  - After SADD: check if received == expected (from meta)
+  - If match → trigger assembly → queue Celery task
+  - Expected set = {"interview_video", "interview_audio"}
+    If has_workexp: add "workexp_video"
+
+────────────────────────────────────────────────────────────────────────────────
+2.4 ASSEMBLY LOCK (prevents double-trigger on concurrent consumers)
+────────────────────────────────────────────────────────────────────────────────
+
+Key     : media:{candidate_id}:lock
+Type    : String ("1")
+TTL     : 300 seconds (5 minutes — max assembly time)
+Commands: SET ... NX EX (atomic)
+
+Example :
+  SET media:550e8400:lock  "1"  NX EX 300
+  # If returns OK → this instance owns assembly
+  # If returns nil → another instance already triggered assembly → skip
+
+Rules   :
+  - Always use SET NX before triggering assembly
+  - Prevents two Kafka consumer instances from both assembling same candidate
+  - TTL ensures lock releases if assembly crashes
+
+
+================================================================================
+3. ML SERVICE REDIS DB 0 (CELERY)
+================================================================================
+
+Managed entirely by Celery. Do not write manual keys to DB 0.
+
+Configuration (celery_app.py):
+  broker_url          = redis://redis:6379/0
+  result_backend      = redis://redis:6379/0
+  result_expires      = 86400   (task results kept 24h)
+  task_serializer     = json
+  result_serializer   = json
+  accept_content      = ['json']
+  task_acks_late      = True    (task not removed from queue until complete)
+  worker_prefetch_multiplier = 1  (one task per worker at a time — heavy ML work)
+
+Key patterns (auto-managed by Celery, do not touch):
+  celery-task-meta-{task_id}   → task result
+  _kombu/binding.celery        → task queue bindings
+  unacked_mutex                → worker ack tracking
+
+
+================================================================================
+4. PRODUCTION REDIS CONFIGURATION (redis.conf)
+================================================================================
+
+# Persistence: RDB snapshot + AOF for durability
+save 900 1          # snapshot if 1 key changed in 900s
+save 300 10         # snapshot if 10 keys changed in 300s
+save 60 10000       # snapshot if 10000 keys changed in 60s
+appendonly yes
+appendfsync everysec   # fsync every second (balance: durability vs performance)
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Memory management
+maxmemory 2gb
+maxmemory-policy allkeys-lru    # evict LRU keys when memory full
+                                # chunk buffers (DB 1) are rebuilable from Kafka
+                                # so LRU eviction is safe
+
+# Connection
+bind 0.0.0.0
+protected-mode yes
+requirepass <REDIS_PASSWORD>    # always set in production
+
+# Performance
+tcp-keepalive 300
+timeout 0
+tcp-backlog 511
+databases 16
+
+# Disable commands that can cause data loss
+rename-command FLUSHALL  ""     # disable in production
+rename-command FLUSHDB   ""     # disable in production
+rename-command DEBUG     ""     # disable in production
+
+
+================================================================================
+5. KEY NAMING CONVENTIONS
+================================================================================
+
+Pattern  : {service}:{entity}:{identifier}:{field}
+Separator: colon (:)
+
+Service prefixes (implicit via DB index, but included for clarity in logs):
+  Backend (DB 2): otp:, ratelimit:, session:, cooldown:, ml_status:, upload:
+  ML Buffer (DB 1): media:
+  ML Celery (DB 0): celery- (auto-managed)
+
+Rules:
+  - All identifiers use UUID format (no personal data in keys)
+  - Phone numbers in OTP keys are the only exception (necessary for OTP lookup)
+  - Never store PII (Aadhaar, name) as Redis key or value
+  - Values containing PII: use HSET with selective fields only (not full user obj)
+
+
+================================================================================
+6. MONITORING IN PRODUCTION
+================================================================================
+
+Key metrics to watch:
+  redis-cli INFO memory     → used_memory, maxmemory, mem_fragmentation_ratio
+  redis-cli INFO stats      → keyspace_hits, keyspace_misses (cache hit rate)
+  redis-cli INFO clients    → connected_clients, blocked_clients
+  redis-cli INFO replication → replication lag (if Sentinel/Cluster)
+
+Alert thresholds:
+  used_memory > 80% of maxmemory → scale up or evict
+  keyspace_misses / (hits + misses) > 20% → review TTLs and caching logic
+  connected_clients > 100 → review connection pooling in app
+
+For production HA: Redis Sentinel (3 nodes: 1 primary + 2 replicas + 3 sentinels)
+
+
+================================================================================
+7. DOCKER COMPOSE REDIS CONFIG
+================================================================================
+
+For hackathon (single instance, docker-compose.yml):
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --databases 16
+    volumes:
+      - redis_data:/data
+
+For production: use Redis Sentinel or Redis Cluster (separate compose/helm chart)
+
+
+================================================================================
+END OF REDIS DESIGN
+================================================================================

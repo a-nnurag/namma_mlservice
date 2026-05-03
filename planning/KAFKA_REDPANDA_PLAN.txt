@@ -1,0 +1,823 @@
+================================================================================
+NAMMAKELSA — KAFKA SERVICE PLAN (REDPANDA)
+================================================================================
+Project      : NammaKelsa — Blue Collar / Polytechnic Job Readiness Platform
+Broker       : Redpanda (Kafka-compatible, no Zookeeper)
+Last Updated : 2026-05-03
+Depends on   : BACKEND_PLAN.txt, ML_SERVICE_PLAN.txt
+================================================================================
+
+TABLE OF CONTENTS
+─────────────────
+1.  Why Redpanda over Apache Kafka
+2.  Architecture Overview
+3.  Topic Design
+4.  Partition & Ordering Strategy
+5.  Message Schemas (all topics)
+6.  Producer Configuration (Backend)
+7.  Consumer Configuration (ML Service)
+8.  Dead Letter Queue Strategy
+9.  Error Handling & Retry Flow
+10. Retention & Storage Sizing
+11. Redpanda Console (Monitoring UI)
+12. Docker Compose Configuration
+13. Topic Provisioning (rpk CLI)
+14. Production Cluster Design
+15. Key Design Decisions & Rationale
+
+
+================================================================================
+1. WHY REDPANDA OVER APACHE KAFKA
+================================================================================
+
+Apache Kafka requires:
+  - Zookeeper (separate JVM process, ~512MB RAM)
+  - Kafka broker (JVM, ~1GB RAM + JVM overhead)
+  - Long startup time (30-60 seconds)
+  - Complex config for small deployments
+
+Redpanda gives you:
+  - Full Kafka API compatibility (aiokafka, confluent-kafka all work unchanged)
+  - Single binary written in C++ (no JVM, no Zookeeper)
+  - ~100ms startup time
+  - ~200MB RAM for single node
+  - Built-in Schema Registry
+  - Built-in Redpanda Console (web UI — impressive for judges)
+  - rpk CLI (like kubectl but for Redpanda)
+  - Lower end-to-end latency (~1ms vs ~5ms for Kafka)
+
+For NammaKelsa specifically:
+  - Single docker-compose.yml replaces kafka + zookeeper (2 services → 1)
+  - Redpanda Console replaces Kafka UI (already built in)
+  - All existing aiokafka producer/consumer code works unchanged
+  - Perfect for hackathon + production path
+
+
+================================================================================
+2. ARCHITECTURE OVERVIEW
+================================================================================
+
+                    BACKEND (FastAPI)
+                    │
+                    │  aiokafka AsyncProducer
+                    │  key = candidate_id (UTF-8)
+                    ▼
+         ┌─────────────────────────────────────┐
+         │         REDPANDA BROKER             │
+         │                                     │
+         │  candidate.interview.video  [3 part] │
+         │  candidate.interview.audio  [3 part] │
+         │  candidate.workexp.video    [3 part] │
+         │  candidate.meta             [3 part] │
+         │  candidate.dlq              [1 part] │
+         │                                     │
+         │  Redpanda Console  :8080            │
+         │  Schema Registry   :8081            │
+         │  Kafka API         :9092            │
+         │  Admin API         :9644            │
+         └──────────────┬──────────────────────┘
+                        │
+                        │  aiokafka AsyncConsumer
+                        │  group_id = ml-service-group
+                        ▼
+                  ML SERVICE (FastAPI)
+                        │
+                        ▼
+                  Redis DB 1 (chunk buffer)
+                        │
+                        ▼
+                  Celery Task Queue
+
+
+================================================================================
+3. TOPIC DESIGN
+================================================================================
+
+┌────────────────────────────┬────────┬──────────┬──────────┬─────────────────┐
+│ Topic                      │ Parts  │ Replicas │ Retention│ Purpose         │
+├────────────────────────────┼────────┼──────────┼──────────┼─────────────────┤
+│ candidate.interview.video  │   3    │    1*    │  24h     │ Interview video  │
+│ candidate.interview.audio  │   3    │    1*    │  24h     │ Interview audio  │
+│ candidate.workexp.video    │   3    │    1*    │  24h     │ Workexp video    │
+│ candidate.meta             │   3    │    1*    │  48h     │ Pipeline trigger │
+│ candidate.dlq              │   1    │    1*    │   7d     │ Failed messages  │
+└────────────────────────────┴────────┴──────────┴──────────┴─────────────────┘
+
+* Replication factor 1 for hackathon (single node).
+  Set to 3 for production (3-node cluster). See Section 14.
+
+Why 3 partitions per media topic:
+  - Supports up to 3 concurrent ML worker instances reading in parallel
+  - Each partition handles one candidate stream at a time (key-based routing)
+  - Scale: add partitions + workers together (Redpanda supports online partition add)
+
+Why 48h retention for candidate.meta:
+  - Meta is the pipeline trigger. If ML service is down, it must replay meta
+    after restart to re-trigger pipelines. 48h gives ample recovery window.
+  - Media topics: 24h is enough — chunks are assembled to disk within minutes.
+    After assembly, chunks in Kafka are no longer needed.
+
+Why DLQ with 7d retention:
+  - Failed messages need human inspection.
+  - 7 days gives the team time to diagnose and replay.
+
+
+================================================================================
+4. PARTITION & ORDERING STRATEGY
+================================================================================
+
+KEY RULE: Always produce with key = candidate_id (bytes)
+─────────────────────────────────────────────────────────
+  Redpanda hashes the key → consistent partition assignment
+  All messages for one candidate → same partition → same consumer → in order
+
+Visual:
+  candidate_A (UUID hash → partition 0) → all chunks read in order by Worker 1
+  candidate_B (UUID hash → partition 1) → all chunks read in order by Worker 2
+  candidate_C (UUID hash → partition 2) → all chunks read in order by Worker 3
+
+Producer key encoding:
+  key = candidate_id.encode("utf-8")   # always UTF-8 bytes
+
+Consumer isolation:
+  Each consumer instance in group ml-service-group is assigned specific
+  partitions. Redpanda rebalances automatically when instances join/leave.
+  partition count (3) == max recommended consumer instances (3).
+
+
+================================================================================
+5. MESSAGE SCHEMAS (ALL TOPICS)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+Topic: candidate.interview.video
+       candidate.interview.audio
+       candidate.workexp.video
+────────────────────────────────────────────────────────────────────────────────
+
+Key   : candidate_id (UTF-8 string of UUID)
+
+Value : JSON
+{
+  "candidate_id": "550e8400-e29b-41d4-a716-446655440000",
+  "media_type":   "interview_video",    // or interview_audio / workexp_video
+  "chunk_seq":    3,                    // 0-indexed, sequential
+  "is_last":      false,                // true on final chunk only
+  "data":         "<base64_encoded_bytes>"
+}
+
+Constraints:
+  - data field: base64 of max 256KB raw bytes → max ~341KB as base64 string
+  - Total message size: ~345KB (within Redpanda 1MB default limit)
+  - chunk_seq: must be sequential from 0 with no gaps
+  - is_last: exactly ONE chunk per candidate per media_type has is_last=true
+  - media_type: must match the topic name (redundant but useful for debugging)
+
+Example (final chunk):
+{
+  "candidate_id": "550e8400-e29b-41d4-a716-446655440000",
+  "media_type":   "interview_video",
+  "chunk_seq":    47,
+  "is_last":      true,
+  "data":         "AAEC..."
+}
+
+────────────────────────────────────────────────────────────────────────────────
+Topic: candidate.meta
+────────────────────────────────────────────────────────────────────────────────
+
+Key   : candidate_id (UTF-8 string of UUID)
+
+Value : JSON
+{
+  "candidate_id":   "550e8400-e29b-41d4-a716-446655440000",
+  "application_id": "a1b2c3d4-...",
+  "session_id":     "e5f6a7b8-...",
+  "has_workexp":    true,
+  "has_degree":     false,
+  "claimed_role":   "electrician",
+  "sent_at":        "2026-05-03T10:15:00Z"
+}
+
+IMPORTANT: Backend must send candidate.meta LAST, after all media chunks
+           are fully produced. The ML service uses meta arrival to know
+           what media types to expect before triggering assembly.
+
+────────────────────────────────────────────────────────────────────────────────
+Topic: candidate.dlq (Dead Letter Queue)
+────────────────────────────────────────────────────────────────────────────────
+
+Key   : original_topic:candidate_id
+
+Value : JSON
+{
+  "original_topic": "candidate.interview.video",
+  "candidate_id":   "550e8400-...",
+  "error":          "gap_in_chunks: missing seq [3, 7]",
+  "failed_at":      "2026-05-03T10:20:00Z",
+  "retry_count":    3,
+  "original_message": { ...original message... }
+}
+
+
+================================================================================
+6. PRODUCER CONFIGURATION (BACKEND)
+================================================================================
+
+Library: aiokafka (AsyncProducer)
+File   : backend/kafka/producer.py
+
+Singleton pattern:
+  _producer: AIOKafkaProducer | None = None
+
+  async def get_producer() -> AIOKafkaProducer:
+      global _producer
+      if _producer is None:
+          _producer = AIOKafkaProducer(**PRODUCER_CONFIG)
+          await _producer.start()
+      return _producer
+
+  async def close_producer():
+      if _producer:
+          await _producer.stop()
+
+PRODUCER_CONFIG = {
+    "bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,   # "redpanda:9092"
+
+    # Reliability
+    "acks":                    "all",    # wait for leader + all in-sync replicas
+                                         # "1" acceptable for hackathon speed
+    "enable_idempotence":      True,     # exactly-once delivery (prevents duplicates)
+    "retries":                 5,
+    "retry_backoff_ms":        100,
+
+    # Throughput
+    "compression_type":        "lz4",   # fast compression, good for base64 data
+    "batch_size":              262144,  # 256KB batch (fill before sending)
+    "linger_ms":               5,       # wait 5ms to batch more messages
+
+    # Message size (must match Redpanda broker config)
+    "max_request_size":        1048576, # 1MB max message size
+
+    # Serialization
+    "key_serializer":          lambda k: k.encode("utf-8") if isinstance(k, str) else k,
+    "value_serializer":        lambda v: json.dumps(v).encode("utf-8"),
+}
+
+Send function signature:
+  async def send_chunk(
+      topic:        str,
+      candidate_id: str,
+      chunk_seq:    int,
+      is_last:      bool,
+      data:         bytes,       # raw bytes, NOT base64 yet
+      media_type:   str,
+  ) -> None:
+      producer = await get_producer()
+      value = {
+          "candidate_id": candidate_id,
+          "media_type":   media_type,
+          "chunk_seq":    chunk_seq,
+          "is_last":      is_last,
+          "data":         base64.b64encode(data).decode("utf-8"),
+      }
+      await producer.send_and_wait(
+          topic,
+          key=candidate_id,
+          value=value,
+      )
+
+  async def send_meta(
+      candidate_id:   str,
+      application_id: str,
+      session_id:     str,
+      has_workexp:    bool,
+      has_degree:     bool,
+      claimed_role:   str,
+  ) -> None:
+      producer = await get_producer()
+      value = {
+          "candidate_id":   candidate_id,
+          "application_id": application_id,
+          "session_id":     session_id,
+          "has_workexp":    has_workexp,
+          "has_degree":     has_degree,
+          "claimed_role":   claimed_role,
+          "sent_at":        datetime.utcnow().isoformat() + "Z",
+      }
+      await producer.send_and_wait(
+          "candidate.meta",
+          key=candidate_id,
+          value=value,
+      )
+
+Send order (enforced by backend/interview/routes.py POST /interview/end):
+  1. send all workexp video chunks  (if has_workexp)
+  2. send all interview audio chunks
+  3. send all interview video chunks
+  4. send meta message              ← ALWAYS LAST
+
+
+================================================================================
+7. CONSUMER CONFIGURATION (ML SERVICE)
+================================================================================
+
+Library: aiokafka (AsyncConsumer)
+File   : ml-service/app/consumers/kafka_consumer.py
+
+CONSUMER_CONFIG = {
+    "bootstrap_servers":    KAFKA_BOOTSTRAP_SERVERS,   # "redpanda:9092"
+    "group_id":             "ml-service-group",
+
+    # Offset management
+    "auto_offset_reset":    "earliest",  # replay from start if new consumer group
+    "enable_auto_commit":   False,       # MANUAL commit after processing
+                                         # prevents data loss on crash
+
+    # Performance
+    "max_poll_records":     10,          # process 10 messages per poll
+    "fetch_max_bytes":      10485760,    # 10MB per fetch (handles large chunks)
+    "max_partition_fetch_bytes": 2097152, # 2MB per partition per fetch
+
+    # Heartbeat (keep consumer alive during slow processing)
+    "session_timeout_ms":   30000,       # 30s — consumer declared dead if no heartbeat
+    "heartbeat_interval_ms": 3000,       # send heartbeat every 3s
+    "max_poll_interval_ms": 300000,      # 5 min max between polls (heavy ML processing)
+
+    # Deserialization
+    "key_deserializer":     lambda k: k.decode("utf-8") if k else None,
+    "value_deserializer":   lambda v: json.loads(v.decode("utf-8")),
+}
+
+Topics to subscribe:
+  consumer.subscribe([
+      "candidate.interview.video",
+      "candidate.interview.audio",
+      "candidate.workexp.video",
+      "candidate.meta",
+  ])
+
+Consumer loop (runs as asyncio background task at FastAPI startup):
+  async def consume_loop():
+      consumer = AIOKafkaConsumer(*topics, **CONSUMER_CONFIG)
+      await consumer.start()
+      try:
+          async for msg in consumer:
+              try:
+                  await route_message(msg)
+                  await consumer.commit()      # manual commit after success
+              except AssemblyError as e:
+                  await send_to_dlq(msg, str(e))
+                  await consumer.commit()      # commit even on DLQ send
+              except Exception as e:
+                  logger.error("Consumer error: %s", e)
+                  # Do NOT commit → message will be redelivered on restart
+      finally:
+          await consumer.stop()
+
+  async def route_message(msg):
+      topic = msg.topic
+      value = msg.value
+
+      if topic == "candidate.meta":
+          await redis_buffer.store_meta(value)
+          await redis_buffer.check_and_trigger(value["candidate_id"])
+      else:
+          # interview_video / interview_audio / workexp_video
+          await redis_buffer.append_chunk(
+              candidate_id = value["candidate_id"],
+              media_type   = value["media_type"],
+              chunk_seq    = value["chunk_seq"],
+              is_last      = value["is_last"],
+              data         = value["data"],      # still base64 here
+          )
+          if value["is_last"]:
+              await redis_buffer.mark_received(
+                  value["candidate_id"],
+                  value["media_type"]
+              )
+              await redis_buffer.check_and_trigger(value["candidate_id"])
+
+Commit strategy:
+  - commit() called per message after successful processing
+  - On exception (not DLQ): do NOT commit → Redpanda redelivers on restart
+  - On DLQ send: commit → message acknowledged, moved to DLQ for manual handling
+
+
+================================================================================
+8. DEAD LETTER QUEUE STRATEGY
+================================================================================
+
+When to send to DLQ (never retry, send immediately):
+  - Gap detected in chunks (missing chunk_seq numbers)
+  - Assembled file size exceeds 100MB limit
+  - Invalid JSON in message value
+  - candidate_id not found in backend DB after 3 retries
+  - Checksum mismatch (if added in future)
+
+When to NOT commit (retry on restart):
+  - Redis connection failure (transient)
+  - DB connection failure (transient)
+  - Assembly disk write failure (transient)
+
+DLQ producer (ml-service/app/consumers/kafka_consumer.py):
+  async def send_to_dlq(original_msg, error: str, retry_count: int = 0):
+      dlq_value = {
+          "original_topic":   original_msg.topic,
+          "candidate_id":     original_msg.value.get("candidate_id"),
+          "error":            error,
+          "failed_at":        datetime.utcnow().isoformat() + "Z",
+          "retry_count":      retry_count,
+          "original_message": original_msg.value,
+      }
+      await dlq_producer.send_and_wait(
+          "candidate.dlq",
+          key=f"{original_msg.topic}:{original_msg.value.get('candidate_id')}",
+          value=dlq_value,
+      )
+      # Also update DB: pipeline_runs.status = 'FAILED'
+
+DLQ monitoring:
+  Redpanda Console shows DLQ message count.
+  Alert if DLQ receives > 0 messages (every message is a bug to investigate).
+
+
+================================================================================
+9. ERROR HANDLING & RETRY FLOW
+================================================================================
+
+Message delivery failure (producer side):
+  Backend producer: acks=all + retries=5 + enable_idempotence=True
+  If all retries fail → log CRITICAL + set application.status = FAILED in backend DB
+  No silent failures.
+
+Chunk gap detection (consumer side):
+  After is_last received:
+    received_seqs = sorted(redis LRANGE chunks)
+    expected = list(range(len(received_seqs)))
+    if received_seqs != expected → SEND TO DLQ
+    Gap means a chunk was dropped by Kafka (extremely rare with acks=all)
+
+Consumer crash mid-assembly:
+  Manual commit = message NOT committed → Redpanda redelivers all uncommitted
+  Redis buffer still has chunks (24h TTL)
+  Consumer restarts → re-reads same messages → re-appends to Redis (idempotent
+  because Redis List is rebuilt from scratch via assembly lock)
+
+Assembly lock prevents double-trigger:
+  SET media:{candidate_id}:lock "1" NX EX 300
+  → Only one consumer instance triggers assembly even if message is re-delivered
+
+Celery task failure:
+  Celery retries 3x with backoff.
+  After 3 failures → pipeline_runs.status = FAILED → DLQ entry created.
+  Admin can re-trigger via POST /admin/trigger/{candidate_id}.
+
+Full error flow:
+  Message received
+    ├── Deserialization error → DLQ (bad producer code, needs fix)
+    ├── Redis error (transient) → do not commit → retry on restart
+    ├── Gap detected → DLQ + pipeline FAILED
+    ├── Assembly success → Celery task queued
+    │     ├── Celery success → pipeline DONE
+    │     └── Celery failure (3x) → pipeline FAILED
+    └── DLQ → admin dashboard flags → manual re-trigger
+
+
+================================================================================
+10. RETENTION & STORAGE SIZING
+================================================================================
+
+Chunk topics (interview.video, interview.audio, workexp.video):
+  Retention policy : time-based, 24 hours
+  Why short        : chunks are assembled to disk within minutes of arrival.
+                     Kafka copies serve no purpose after assembly.
+  Size estimate    :
+    1 interview video  : ~30MB assembled → ~40MB as base64 chunks in Kafka
+    1 interview audio  : ~5MB assembled  → ~7MB as base64 chunks in Kafka
+    1 workexp video    : ~50MB assembled → ~67MB as base64 chunks in Kafka
+    Per candidate      : ~114MB in Kafka
+    50 candidates/day  : ~5.7GB/day in Kafka (peaks during events)
+    24h retention      : keep max ~5.7GB on disk for chunk topics
+    Recommendation     : provision 20GB for chunk topics (4x safety margin)
+
+Meta topic:
+  Retention   : 48 hours
+  Size        : ~1KB per message, negligible
+
+DLQ topic:
+  Retention   : 7 days
+  Size        : small (only failed messages, hopefully near zero)
+
+Total Redpanda disk (hackathon, single node):
+  Chunk topics : 20GB
+  Meta + DLQ   : 1GB
+  Redpanda WAL : 5GB
+  Total        : ~26GB → provision 40GB volume
+
+Per-topic retention configuration (set at creation time via rpk):
+  candidate.interview.video : retention.ms=86400000  (24h)
+  candidate.interview.audio : retention.ms=86400000  (24h)
+  candidate.workexp.video   : retention.ms=86400000  (24h)
+  candidate.meta            : retention.ms=172800000 (48h)
+  candidate.dlq             : retention.ms=604800000 (7d)
+
+Per-topic message size configuration:
+  All chunk topics: max.message.bytes=1048576  (1MB — covers 256KB chunk + base64)
+
+
+================================================================================
+11. REDPANDA CONSOLE (MONITORING UI)
+================================================================================
+
+Redpanda Console is a web UI that ships separately (docker image: redpandadata/console).
+It connects to Redpanda via the Admin API (port 9644).
+
+URL: http://localhost:8080 (or http://your-server:8080)
+
+What it shows:
+  Topics tab     : message count, partition lag, retention, message browser
+                   (view actual messages in each topic — useful for debugging)
+  Consumer Groups: lag per partition, offset tracking for ml-service-group
+  Schema Registry: message schemas (if Avro/Protobuf used later)
+  Cluster        : broker health, disk usage, replication status
+
+Judge demo value:
+  - Show live messages arriving in candidate.interview.video during interview
+  - Show consumer group lag dropping to 0 as ML service processes
+  - Show DLQ is empty (healthy system)
+  - Show per-topic retention policies
+
+Configuration (docker-compose.yml):
+  console:
+    image: redpandadata/console:latest
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_FILEPATH: /etc/console/config.yaml
+    volumes:
+      - ./redpanda-console-config.yaml:/etc/console/config.yaml
+
+redpanda-console-config.yaml:
+  kafka:
+    brokers:
+      - redpanda:9092
+  redpanda:
+    adminApi:
+      enabled: true
+      urls:
+        - http://redpanda:9644
+
+
+================================================================================
+12. DOCKER COMPOSE CONFIGURATION
+================================================================================
+
+# docker-compose.yml (Redpanda section)
+
+  redpanda:
+    image: redpandadata/redpanda:v23.3.1
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container          # dev mode: relaxed memory limits
+      - --smp 1                       # 1 CPU core for hackathon
+      - --default-log-level=warn
+      - --set redpanda.auto_create_topics_enabled=false  # explicit topic creation only
+    ports:
+      - "19092:19092"    # external Kafka API (from host/tools like rpk)
+      - "18081:18081"    # external Schema Registry
+      - "18082:18082"    # external HTTP Proxy
+      - "9644:9644"      # Admin API (used by Redpanda Console)
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info", "--brokers=redpanda:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: redpanda-console
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      CONFIG_FILEPATH: /etc/console/config.yaml
+    volumes:
+      - ./config/redpanda-console.yaml:/etc/console/config.yaml
+
+  # One-time topic initializer (runs then exits)
+  redpanda-init:
+    image: redpandadata/redpanda:v23.3.1
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        rpk topic create candidate.interview.video \
+          --brokers redpanda:9092 \
+          --partitions 3 \
+          --replicas 1 \
+          --topic-config retention.ms=86400000 \
+          --topic-config max.message.bytes=1048576
+
+        rpk topic create candidate.interview.audio \
+          --brokers redpanda:9092 \
+          --partitions 3 \
+          --replicas 1 \
+          --topic-config retention.ms=86400000 \
+          --topic-config max.message.bytes=1048576
+
+        rpk topic create candidate.workexp.video \
+          --brokers redpanda:9092 \
+          --partitions 3 \
+          --replicas 1 \
+          --topic-config retention.ms=86400000 \
+          --topic-config max.message.bytes=1048576
+
+        rpk topic create candidate.meta \
+          --brokers redpanda:9092 \
+          --partitions 3 \
+          --replicas 1 \
+          --topic-config retention.ms=172800000
+
+        rpk topic create candidate.dlq \
+          --brokers redpanda:9092 \
+          --partitions 1 \
+          --replicas 1 \
+          --topic-config retention.ms=604800000
+
+        echo "All topics created successfully"
+
+Ports summary:
+  Internal (docker network) : redpanda:9092   ← backend + ml-service use this
+  External (from your host) : localhost:19092  ← rpk CLI, debugging tools
+  Admin API                 : localhost:9644   ← Redpanda Console
+  Console UI                : localhost:8080   ← judges demo
+
+
+================================================================================
+13. TOPIC PROVISIONING (rpk CLI)
+================================================================================
+
+rpk is Redpanda's CLI tool. Included in the Redpanda Docker image.
+For local use: brew install redpanda-data/tap/redpanda
+
+Connect from host:
+  rpk --brokers localhost:19092 <command>
+
+Connect from inside Docker:
+  docker exec -it redpanda rpk --brokers localhost:9092 <command>
+
+Useful commands:
+
+  # List all topics
+  rpk topic list
+
+  # Describe topic (partitions, offsets, config)
+  rpk topic describe candidate.interview.video
+
+  # Consume messages (debugging)
+  rpk topic consume candidate.meta --offset start
+
+  # Check consumer group lag
+  rpk group describe ml-service-group
+
+  # Delete and recreate topic (dev reset)
+  rpk topic delete candidate.interview.video
+  rpk topic create candidate.interview.video --partitions 3 ...
+
+  # View cluster health
+  rpk cluster info
+
+  # Check broker metrics
+  rpk cluster health
+
+  # Add partitions (scale up, never scale down)
+  rpk topic alter-config candidate.interview.video --set num.partitions=6
+
+  # Check message count per topic
+  rpk topic describe candidate.interview.video -p
+
+
+================================================================================
+14. PRODUCTION CLUSTER DESIGN
+================================================================================
+
+For hackathon: single Redpanda node (--mode dev-container, 1 SMP)
+
+For production: 3-node Redpanda cluster
+─────────────────────────────────────────
+
+Minimum 3 nodes for:
+  - High availability (survive 1 node failure)
+  - Replication factor 3
+  - min_insync_replicas = 2 (write succeeds if 2/3 replicas confirm)
+
+Node sizing per broker:
+  CPU    : 4 cores
+  RAM    : 8GB (Redpanda is memory-efficient vs Kafka JVM)
+  Disk   : 100GB SSD (NVMe preferred for low latency)
+  Network: 1Gbps
+
+Production topic config changes:
+  --replicas 3                          (all topics)
+  --topic-config min.insync.replicas=2  (all topics)
+
+Producer changes for 3-node:
+  acks = "all"    (same, already correct)
+  No code change needed.
+
+Consumer changes for 3-node:
+  No code change needed. Redpanda handles failover transparently.
+
+Production redpanda.yaml additions:
+  redpanda:
+    data_directory: /var/lib/redpanda/data
+    seed_servers:
+      - host: {node1_ip}
+        port: 33145
+      - host: {node2_ip}
+        port: 33145
+      - host: {node3_ip}
+        port: 33145
+
+Monitoring in production:
+  Redpanda exposes Prometheus metrics at :9644/metrics
+  Scrape with Prometheus, visualize in Grafana
+  Key metrics:
+    redpanda_kafka_request_latency_seconds
+    redpanda_storage_disk_free_bytes
+    redpanda_kafka_consumer_group_committed_offset (lag)
+    redpanda_cluster_unavailable_partitions (should be 0)
+
+Alert rules:
+  Consumer lag > 1000 messages on any partition → ML service may be overloaded
+  Disk free < 20% → urgent: increase storage or lower retention
+  unavailable_partitions > 0 → broker failure, immediate action needed
+
+
+================================================================================
+15. KEY DESIGN DECISIONS & RATIONALE
+================================================================================
+
+Why Redpanda instead of Apache Kafka?
+  No Zookeeper = one less service to manage and debug.
+  Lower memory footprint (~200MB vs ~1.5GB for Kafka+ZK) frees resources
+  for ML models which need significant RAM.
+  Identical Kafka API = zero code change in aiokafka producer/consumer.
+  Redpanda Console included free = no need for separate Kafka UI deployment.
+  rpk CLI is simpler than Kafka's bin/ scripts for topic management.
+
+Why auto_create_topics_enabled=false?
+  Prevents accidental topic creation from typos in topic names.
+  All topics are explicitly provisioned by redpanda-init container.
+  If backend sends to wrong topic name → error logged, not silent data loss.
+
+Why enable_idempotence=True on producer?
+  Prevents duplicate chunks if the producer retries after a timeout.
+  Without idempotence: network blip → producer retries → duplicate chunk in topic
+  → ML service assembles corrupt video with repeated chunks.
+  With idempotence: Redpanda deduplicates retries at broker level. Safe.
+
+Why max_poll_interval_ms=300000 (5 min) on consumer?
+  ML assembly can take 30-60 seconds for a 100MB video.
+  Default interval is 300s which is fine, but worth explicitly setting.
+  If consumer takes > 5 min between polls → Redpanda kicks it from group.
+  This won't happen (assembly is fast), but explicit config prevents surprises.
+
+Why 256KB chunks from backend → Kafka (not same 64KB as frontend → backend)?
+  Frontend → backend: 64KB is optimal for 2G upload (client bandwidth limit).
+  Backend → Kafka: 256KB is optimal for Kafka throughput (broker I/O limit).
+  Backend reassembles 4x 64KB chunks into 1x 256KB Kafka message silently.
+  Two different concerns: client bandwidth vs broker throughput.
+
+Why manual commit on consumer (not auto-commit)?
+  Auto-commit commits on a timer, not on successful processing.
+  If consumer crashes between auto-commit and processing → message lost.
+  Manual commit: commit only after chunk is in Redis buffer.
+  Guarantees at-least-once delivery even on consumer crash.
+
+Why base64 for chunk data (not raw bytes)?
+  Kafka messages are typically JSON for schema compatibility and debuggability.
+  base64 embeds binary data cleanly in JSON strings.
+  Redpanda Console can display base64 messages (raw bytes would be garbled).
+  ~33% overhead is acceptable for hackathon. Production upgrade: use Avro
+  with binary encoding via Schema Registry to eliminate base64 overhead.
+
+================================================================================
+END OF KAFKA/REDPANDA PLAN
+================================================================================
