@@ -19,6 +19,9 @@ class MLSettings(BaseSettings):
     KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9092"
     KAFKA_CONSUMER_GROUP: str = "ml-service-group"
     KAFKA_CONSUMER_BACKEND: str = "aiokafka"  # aiokafka | mock
+    KAFKA_USE_SSL: bool = False
+    KAFKA_SASL_USERNAME: str = ""
+    KAFKA_SASL_PASSWORD: str = ""
 
     # Storage strategy
     STORAGE_BACKEND: str = "local"  # local | s3
@@ -43,6 +46,13 @@ class MLSettings(BaseSettings):
     # Face similarity threshold (same as backend)
     FACE_SIMILARITY_THRESHOLD: float = 0.85
     VOICE_SIMILARITY_THRESHOLD: float = 0.75
+
+    # CORS — comma-separated list of allowed origins
+    ALLOWED_ORIGINS: str = "http://localhost:3000"
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]
 
     class Config:
         env_file = ".env"

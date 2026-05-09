@@ -63,10 +63,16 @@ class AIOKafkaConsumerAdapter(KafkaConsumerAdapter):
         bootstrap_servers: str,
         group_id: str,
         topics: list[str] = TOPICS,
+        use_ssl: bool = False,
+        sasl_username: str = "",
+        sasl_password: str = "",
     ) -> None:
         self._bootstrap = bootstrap_servers
         self._group_id = group_id
         self._topics = topics
+        self._use_ssl = use_ssl
+        self._sasl_username = sasl_username
+        self._sasl_password = sasl_password
         self._handlers: dict[str, list[Handler]] = defaultdict(list)
         self._consumer = None
         self._task: asyncio.Task | None = None
@@ -88,14 +94,23 @@ class AIOKafkaConsumerAdapter(KafkaConsumerAdapter):
                 error_code=MLErrorCode.KAFKA_CONSUMER_FAILED,
             ) from exc
 
-        self._consumer = AIOKafkaConsumer(
-            *self._topics,
+        kwargs: dict = dict(
             bootstrap_servers=self._bootstrap,
             group_id=self._group_id,
             auto_offset_reset="earliest",
             enable_auto_commit=True,
             value_deserializer=lambda v: v,
         )
+        if self._use_ssl:
+            import ssl
+            kwargs.update(
+                security_protocol="SASL_SSL",
+                sasl_mechanism="SCRAM-SHA-256",
+                sasl_plain_username=self._sasl_username,
+                sasl_plain_password=self._sasl_password,
+                ssl_context=ssl.create_default_context(),
+            )
+        self._consumer = AIOKafkaConsumer(*self._topics, **kwargs)
         try:
             await self._consumer.start()
             self._running = True
@@ -217,10 +232,13 @@ class MockKafkaConsumerAdapter(KafkaConsumerAdapter):
 def build_kafka_consumer() -> KafkaConsumerAdapter:
     backend = settings.KAFKA_CONSUMER_BACKEND.lower()
     if backend == "aiokafka":
-        log.info("Using AIOKafkaConsumerAdapter", servers=settings.KAFKA_BOOTSTRAP_SERVERS)
+        log.info("Using AIOKafkaConsumerAdapter", servers=settings.KAFKA_BOOTSTRAP_SERVERS, ssl=settings.KAFKA_USE_SSL)
         return AIOKafkaConsumerAdapter(
             bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
             group_id=settings.KAFKA_CONSUMER_GROUP,
+            use_ssl=settings.KAFKA_USE_SSL,
+            sasl_username=settings.KAFKA_SASL_USERNAME,
+            sasl_password=settings.KAFKA_SASL_PASSWORD,
         )
     log.info("Using MockKafkaConsumerAdapter")
     return MockKafkaConsumerAdapter()

@@ -38,7 +38,7 @@ def _make_handler(topic: str):
             log.warning("Message missing candidate_id", topic=t)
             return
 
-        chunk_index = int(payload.get("chunk_index", 0))
+        chunk_index = int(payload.get("chunk_seq", payload.get("chunk_index", 0)))
         is_last     = bool(payload.get("is_last", False))
 
         # Payload data may be base64-encoded bytes or JSON metadata
